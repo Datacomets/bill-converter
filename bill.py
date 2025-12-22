@@ -11,6 +11,9 @@ st.set_page_config(page_title="Sales Bill Converter", layout="wide")
 DATE_RE = re.compile(r"(\d{1,2}/\d{1,2}/\d{4})")
 
 
+# ----------------------------
+# Column letter helpers (A, B, ..., Z, AA, AB, ...)
+# ----------------------------
 def idx_to_col(n: int) -> str:
     n += 1
     s = ""
@@ -28,6 +31,9 @@ def col_to_idx(col: str) -> int:
     return n - 1
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def as_str(x):
     try:
         if pd.isna(x):
@@ -106,12 +112,20 @@ def is_barcode_like(s: str) -> bool:
     return bool(re.fullmatch(r"\d{8,}", as_str(s)))
 
 
+def is_numeric_like(s: str) -> bool:
+    """ตัวเลขล้วน (ใช้กันกรณี item เป็นเลขบิล/รหัส)"""
+    return bool(re.fullmatch(r"\d+", as_str(s)))
+
+
 def make_unique_bill_id(machine_name: str, bill_no: str) -> str:
     m = as_str(machine_name)
     b = as_str(bill_no)
     return f"{m}-{b}" if m else f"-{b}"
 
 
+# ----------------------------
+# Header extraction (AUTO)
+# ----------------------------
 def extract_header_info_auto(rows, bill_col_idx=0, scan_cols=200, max_header_rows=80):
     first_bill_row = None
     for r in range(min(max_header_rows, len(rows))):
@@ -142,6 +156,9 @@ def extract_header_info_auto(rows, bill_col_idx=0, scan_cols=200, max_header_row
     return machine_name, date_from, date_to
 
 
+# ----------------------------
+# Core parser
+# ----------------------------
 def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_empty_rows=10):
     machine_name, date_from, date_to = header_info
 
@@ -164,16 +181,19 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
             continue
         empty_run = 0
 
+        # bill
         raw_bill = as_str(row[colmap["bill_no"]]) if colmap["bill_no"] < len(row) else ""
         if raw_bill != "" and re.fullmatch(r"\d{4,}", raw_bill):
             current_bill = raw_bill
         if current_bill == "":
             continue
 
+        # time
         raw_time = normalize_time(row[colmap["time"]]) if colmap["time"] < len(row) else ""
         if raw_time != "":
             current_time = raw_time
 
+        # payment
         raw_pay = as_str(row[colmap["pay"]]) if colmap["pay"] < len(row) else ""
         pay = normalize_payment(raw_pay)
         if pay != "":
@@ -183,20 +203,41 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
             if current_bill in payment_by_bill:
                 current_payment = payment_by_bill[current_bill]
 
+        # item
         item = as_str(row[colmap["item"]]) if colmap["item"] < len(row) else ""
 
-        if is_barcode_like(item):
-            if next_item_idx is not None and next_item_idx < len(row):
-                item2 = as_str(row[next_item_idx])
-                if item2 and not is_barcode_like(item2):
-                    item = item2
+        # ✅ FIX: ถ้า item เป็นเลขบิล/เลขล้วน/บาร์โค้ด → ไม่ใช่ชื่อสินค้า
+        # ให้ลองดึงจากคอลัมน์สำรอง (ถัดไป) ถ้ามี
+        if item != "":
+            is_bad_numeric_item = False
+
+            # กรณี item เป็นเลขล้วน เช่น 3100010
+            if is_numeric_like(item):
+                # ถ้าเหมือนเลขบิลปัจจุบัน หรือดูเป็น bill_no/barcode → ถือว่าไม่ใช่สินค้า
+                if item == current_bill or is_bill_no_text(item) or is_barcode_like(item):
+                    is_bad_numeric_item = True
+
+            # กรณี item เป็นบาร์โค้ด
+            if is_barcode_like(item):
+                is_bad_numeric_item = True
+
+            if is_bad_numeric_item:
+                if next_item_idx is not None and next_item_idx < len(row):
+                    item2 = as_str(row[next_item_idx])
+                    # item สำรองต้องไม่ใช่เลขล้วนยาว ๆ
+                    if item2 and not is_numeric_like(item2) and not is_barcode_like(item2):
+                        item = item2
+                    else:
+                        # ยังไม่ใช่ชื่อสินค้า → ข้ามแถว
+                        continue
                 else:
+                    # ไม่มีคอลัมน์สำรอง → ข้ามแถว
                     continue
-            else:
-                continue
 
         if item == "":
             continue
+
+        # ข้าม TOTAL เดิมในไฟล์
         if looks_like_total_text(item):
             continue
 
@@ -207,6 +248,7 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
         if qty is None and price is None and amount is None:
             continue
 
+        # discount เฉพาะ “บรรทัดสินค้า”
         discount = 0.0
         if amount is not None and amount < 0:
             discount = float(abs(amount))
@@ -261,7 +303,7 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
     total_rows["qty"] = None
     total_rows["price"] = None
     total_rows["line_amount"] = None
-    total_rows["discount"] = None  # TOTAL ไม่ต้องมี discount
+    total_rows["discount"] = None  # ✅ TOTAL ไม่ใส่ discount
     total_rows["_row_order"] = 10**9
     total_rows["machine_name"] = machine_name
     total_rows["unique_bill_id"] = total_rows["bill_no"].apply(lambda b: make_unique_bill_id(machine_name, b))
@@ -270,6 +312,7 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
 
     df_out = pd.concat([df, total_rows], ignore_index=True, sort=False)
     df_out["__bill_sort__"] = pd.to_numeric(df_out["bill_no"], errors="coerce")
+
     df_out = (
         df_out.sort_values(by=["__bill_sort__", "_row_order"], ascending=[True, True])
         .drop(columns=["__bill_sort__", "_row_order"])
@@ -294,10 +337,14 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
     ]
 
 
+# ----------------------------
+# File reading
+# ----------------------------
 def read_rows_from_upload(uploaded_file, sheet_name=None):
     name = uploaded_file.name.lower()
     if name.endswith(".xlsx"):
         from openpyxl import load_workbook
+
         wb = load_workbook(uploaded_file, data_only=True)
         if sheet_name is None:
             sheet_name = wb.sheetnames[0]
@@ -316,6 +363,9 @@ def read_rows_from_upload(uploaded_file, sheet_name=None):
         raise ValueError("รองรับเฉพาะ .xlsx / .xls")
 
 
+# ----------------------------
+# UI
+# ----------------------------
 st.title("🧾 แปลงไฟล์บิล (TOTAL ใหม่ + วิธีจ่าย + ชื่อเครื่อง/วันที่จากหัวไฟล์ + Unique Bill ID + Discount)")
 
 uploaded_files = st.file_uploader(
@@ -354,7 +404,7 @@ with c5:
 with c6:
     amt_col = st.selectbox("ยอดบรรทัด (line_amount)", col_letters, index=safe_index("K"))
 
-st.caption("ถ้า item บางแถวกลายเป็นบาร์โค้ด (885...) ให้เลือกคอลัมน์ถัดไปที่เป็นชื่อสินค้า")
+st.caption("ถ้า item บางแถวเป็นเลข (เช่น เลขบิล/บาร์โค้ด) ให้เลือกคอลัมน์สำรองที่เป็นชื่อสินค้า (ถัดไป)")
 next_item_col = st.selectbox("คอลัมน์ชื่อสินค้า (สำรอง / ถัดไป)", ["(ไม่ใช้)"] + col_letters, index=0)
 next_item_idx = None if next_item_col == "(ไม่ใช้)" else col_to_idx(next_item_col)
 
@@ -406,7 +456,7 @@ if not dfs:
 
 df_all = pd.concat(dfs, ignore_index=True)
 
-# เปลี่ยนชื่อคอลัมน์ตามที่ขอ (ใช้ตอนแสดงผล/ดาวน์โหลด)
+# เปลี่ยนชื่อคอลัมน์ตามที่ขอ
 df_all = df_all.rename(columns={
     "line_amount": "ยอดรวมสินค้า",
     "bill_total": "ยอดรวมบิล",
