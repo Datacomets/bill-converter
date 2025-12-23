@@ -12,7 +12,7 @@ DATE_RE = re.compile(r"(\d{1,2}/\d{1,2}/\d{4})")
 
 
 # ----------------------------
-# Column letter helpers (A, B, ..., Z, AA, AB, ...)
+# Column letter helpers
 # ----------------------------
 def idx_to_col(n: int) -> str:
     n += 1
@@ -80,7 +80,8 @@ def looks_like_total_text(item_text: str) -> bool:
     s = as_str(item_text).upper()
     if s == "":
         return False
-    return ("TOTAL" in s) or ("รวม" in as_str(item_text)) or ("ยอดรวม" in as_str(item_text))
+    t = as_str(item_text)
+    return ("TOTAL" in s) or ("รวม" in t) or ("ยอดรวม" in t)
 
 
 def normalize_payment(text: str) -> str:
@@ -104,17 +105,26 @@ def df_to_excel_bytes(df: pd.DataFrame):
     return bio.getvalue()
 
 
-def is_bill_no_text(s: str) -> bool:
-    return bool(re.fullmatch(r"\d{4,}", as_str(s)))
+def is_numeric_like(s: str) -> bool:
+    return bool(re.fullmatch(r"\d+", as_str(s)))
 
 
 def is_barcode_like(s: str) -> bool:
-    return bool(re.fullmatch(r"\d{8,}", as_str(s)))
+    """
+    barcode มักยาว 10-14+ หลัก (ไทยพบบ่อย 13 หลักเริ่ม 885)
+    ตรงนี้ใช้กันเฉพาะตอน "ห้ามตั้งเลขบิลเป็น barcode"
+    """
+    s = as_str(s)
+    return bool(re.fullmatch(r"\d{10,}", s))
 
 
-def is_numeric_like(s: str) -> bool:
-    """ตัวเลขล้วน (ใช้กันกรณี item เป็นเลขบิล/รหัส)"""
-    return bool(re.fullmatch(r"\d+", as_str(s)))
+def is_bill_no_text(s: str) -> bool:
+    """
+    ✅ เลขบิล = ตัวเลขล้วน และ "ต้องไม่ใช่ barcode"
+    เราไม่ fix ความยาวเลขบิล แต่กัน barcode (10+ หลัก) ออก
+    """
+    s = as_str(s)
+    return is_numeric_like(s) and (not is_barcode_like(s))
 
 
 def make_unique_bill_id(machine_name: str, bill_no: str) -> str:
@@ -126,7 +136,7 @@ def make_unique_bill_id(machine_name: str, bill_no: str) -> str:
 # ----------------------------
 # Header extraction (AUTO)
 # ----------------------------
-def extract_header_info_auto(rows, bill_col_idx=0, scan_cols=200, max_header_rows=80):
+def extract_header_info_auto(rows, bill_col_idx=0, scan_cols=200, max_header_rows=120):
     first_bill_row = None
     for r in range(min(max_header_rows, len(rows))):
         row = rows[r] or []
@@ -181,10 +191,11 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
             continue
         empty_run = 0
 
-        # bill
+        # ✅ อัปเดตเลขบิล เฉพาะค่าที่ "ไม่ใช่ barcode"
         raw_bill = as_str(row[colmap["bill_no"]]) if colmap["bill_no"] < len(row) else ""
-        if raw_bill != "" and re.fullmatch(r"\d{4,}", raw_bill):
+        if raw_bill != "" and is_bill_no_text(raw_bill):
             current_bill = raw_bill
+
         if current_bill == "":
             continue
 
@@ -205,40 +216,26 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
 
         # item
         item = as_str(row[colmap["item"]]) if colmap["item"] < len(row) else ""
-
-        # ✅ FIX: ถ้า item เป็นเลขบิล/เลขล้วน/บาร์โค้ด → ไม่ใช่ชื่อสินค้า
-        # ให้ลองดึงจากคอลัมน์สำรอง (ถัดไป) ถ้ามี
-        if item != "":
-            is_bad_numeric_item = False
-
-            # กรณี item เป็นเลขล้วน เช่น 3100010
-            if is_numeric_like(item):
-                # ถ้าเหมือนเลขบิลปัจจุบัน หรือดูเป็น bill_no/barcode → ถือว่าไม่ใช่สินค้า
-                if item == current_bill or is_bill_no_text(item) or is_barcode_like(item):
-                    is_bad_numeric_item = True
-
-            # กรณี item เป็นบาร์โค้ด
-            if is_barcode_like(item):
-                is_bad_numeric_item = True
-
-            if is_bad_numeric_item:
-                if next_item_idx is not None and next_item_idx < len(row):
-                    item2 = as_str(row[next_item_idx])
-                    # item สำรองต้องไม่ใช่เลขล้วนยาว ๆ
-                    if item2 and not is_numeric_like(item2) and not is_barcode_like(item2):
-                        item = item2
-                    else:
-                        # ยังไม่ใช่ชื่อสินค้า → ข้ามแถว
-                        continue
-                else:
-                    # ไม่มีคอลัมน์สำรอง → ข้ามแถว
-                    continue
-
-        if item == "":
-            continue
+        item2 = ""
+        if next_item_idx is not None and next_item_idx < len(row):
+            item2 = as_str(row[next_item_idx])
 
         # ข้าม TOTAL เดิมในไฟล์
-        if looks_like_total_text(item):
+        if looks_like_total_text(item) or looks_like_total_text(item2):
+            continue
+
+        # ถ้า item ว่าง ใช้ item2
+        if item == "" and item2 != "":
+            item = item2
+
+        # ถ้า item เท่ากับเลขบิล ให้ลองใช้ item2 แทน
+        if item != "" and item == current_bill:
+            if item2 != "" and item2 != current_bill:
+                item = item2
+            else:
+                continue
+
+        if item == "":
             continue
 
         qty = to_float(row[colmap["qty"]]) if colmap["qty"] < len(row) else None
@@ -248,7 +245,7 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
         if qty is None and price is None and amount is None:
             continue
 
-        # discount เฉพาะ “บรรทัดสินค้า”
+        # discount: ยอดรวมสินค้าติดลบ
         discount = 0.0
         if amount is not None and amount < 0:
             discount = float(abs(amount))
@@ -303,7 +300,7 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
     total_rows["qty"] = None
     total_rows["price"] = None
     total_rows["line_amount"] = None
-    total_rows["discount"] = None  # ✅ TOTAL ไม่ใส่ discount
+    total_rows["discount"] = None  # TOTAL ไม่ใส่ discount
     total_rows["_row_order"] = 10**9
     total_rows["machine_name"] = machine_name
     total_rows["unique_bill_id"] = total_rows["bill_no"].apply(lambda b: make_unique_bill_id(machine_name, b))
@@ -404,7 +401,7 @@ with c5:
 with c6:
     amt_col = st.selectbox("ยอดบรรทัด (line_amount)", col_letters, index=safe_index("K"))
 
-st.caption("ถ้า item บางแถวเป็นเลข (เช่น เลขบิล/บาร์โค้ด) ให้เลือกคอลัมน์สำรองที่เป็นชื่อสินค้า (ถัดไป)")
+st.caption("ถ้า 'สินค้า' บางแถวหลุดไปเป็นเลขบิล ให้เลือกคอลัมน์สำรองที่เป็นชื่อสินค้า")
 next_item_col = st.selectbox("คอลัมน์ชื่อสินค้า (สำรอง / ถัดไป)", ["(ไม่ใช้)"] + col_letters, index=0)
 next_item_idx = None if next_item_col == "(ไม่ใช้)" else col_to_idx(next_item_col)
 
