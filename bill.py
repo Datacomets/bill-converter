@@ -110,20 +110,22 @@ def is_numeric_like(s: str) -> bool:
 
 
 def is_barcode_like(s: str) -> bool:
-    """
-    barcode มักยาว 10-14+ หลัก (ไทยพบบ่อย 13 หลักเริ่ม 885)
-    กันเฉพาะตอน "ห้ามตั้งเลขบิลเป็น barcode"
-    """
+    # barcode มักยาว 10-14+ หลัก (ไทยพบบ่อย 13 หลักเริ่ม 885)
     s = as_str(s)
     return bool(re.fullmatch(r"\d{10,}", s))
 
 
 def is_bill_no_text(s: str) -> bool:
     """
-    ✅ เลขบิล = ตัวเลขล้วน และ "ต้องไม่ใช่ barcode"
+    ✅ ตามที่คุณย้ำ: เลขบิล = ตัวเลข 6 หลักเท่านั้น
+    (และกัน barcode 10+ หลักไว้ด้วยเผื่อคอลัมน์เดียวกันมีบาร์โค้ด)
     """
     s = as_str(s)
-    return is_numeric_like(s) and (not is_barcode_like(s))
+    if not re.fullmatch(r"\d{6}", s):
+        return False
+    if is_barcode_like(s):
+        return False
+    return True
 
 
 def make_unique_bill_id(machine_name: str, bill_no: str) -> str:
@@ -190,12 +192,12 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
             continue
         empty_run = 0
 
-        # ---- อ่านเวลา/วิธีจ่ายของแถวนี้ก่อน (ใช้ยืนยันหัวบิลจริง) ----
+        # อ่านเวลา/วิธีจ่ายของแถวนี้ก่อน (ยืนยันหัวบิล)
         raw_time_now = normalize_time(row[colmap["time"]]) if colmap["time"] < len(row) else ""
         raw_pay_now = as_str(row[colmap["pay"]]) if colmap["pay"] < len(row) else ""
         pay_now = normalize_payment(raw_pay_now)
 
-        # ✅ อัปเดตเลขบิลเฉพาะ "หัวบิล" เท่านั้น (ต้องมีเวลา หรือ วิธีจ่าย ในแถวเดียวกัน)
+        # ✅ อัปเดตเลขบิล เฉพาะหัวบิลจริง + ต้องเป็นเลข 6 หลักเท่านั้น
         raw_bill = as_str(row[colmap["bill_no"]]) if colmap["bill_no"] < len(row) else ""
         if raw_bill != "" and is_bill_no_text(raw_bill) and (raw_time_now != "" or pay_now != ""):
             current_bill = raw_bill
@@ -203,7 +205,7 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
         if current_bill == "":
             continue
 
-        # ---- ใช้ค่าเวลา/วิธีจ่ายที่อ่านไว้ ----
+        # ใช้ค่าเวลา/วิธีจ่าย
         if raw_time_now != "":
             current_time = raw_time_now
 
@@ -228,9 +230,9 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
         if item == "" and item2 != "":
             item = item2
 
-        # ถ้า item เท่ากับเลขบิล ให้ลองใช้ item2 แทน (ไม่ให้เลขบิลไปอยู่ใน item)
-        if item != "" and item == current_bill:
-            if item2 != "" and item2 != current_bill:
+        # กันเคส item เผลอเป็นเลขบิล (6 หลัก) -> ถือว่าไม่ใช่ชื่อสินค้า
+        if item != "" and is_bill_no_text(item):
+            if item2 != "" and (not is_bill_no_text(item2)):
                 item = item2
             else:
                 continue
@@ -382,9 +384,11 @@ col_letters = [idx_to_col(i) for i in range(max_cols_detected)]
 
 st.subheader("ตั้งค่าคอลัมน์ข้อมูลบิล (ใช้ร่วมกันทุกไฟล์)")
 
+
 def safe_index(colname: str) -> int:
     i = col_to_idx(colname)
     return i if 0 <= i < len(col_letters) else 0
+
 
 c0, c1, c2, c3, c4, c5, c6 = st.columns(7)
 with c0:
@@ -455,10 +459,12 @@ if not dfs:
 df_all = pd.concat(dfs, ignore_index=True)
 
 # เปลี่ยนชื่อคอลัมน์ตามที่ขอ
-df_all = df_all.rename(columns={
-    "line_amount": "ยอดรวมสินค้า",
-    "bill_total": "ยอดรวมบิล",
-})
+df_all = df_all.rename(
+    columns={
+        "line_amount": "ยอดรวมสินค้า",
+        "bill_total": "ยอดรวมบิล",
+    }
+)
 
 st.subheader("ผลลัพธ์รวม (ทุกไฟล์)")
 st.write(f"พบรายการรวม: **{len(df_all):,}** แถว | พบเลขบิลรวม: **{df_all['bill_no'].nunique():,}** บิล")
