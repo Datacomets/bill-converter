@@ -112,7 +112,7 @@ def is_numeric_like(s: str) -> bool:
 def is_barcode_like(s: str) -> bool:
     """
     barcode มักยาว 10-14+ หลัก (ไทยพบบ่อย 13 หลักเริ่ม 885)
-    ตรงนี้ใช้กันเฉพาะตอน "ห้ามตั้งเลขบิลเป็น barcode"
+    กันเฉพาะตอน "ห้ามตั้งเลขบิลเป็น barcode"
     """
     s = as_str(s)
     return bool(re.fullmatch(r"\d{10,}", s))
@@ -121,7 +121,6 @@ def is_barcode_like(s: str) -> bool:
 def is_bill_no_text(s: str) -> bool:
     """
     ✅ เลขบิล = ตัวเลขล้วน และ "ต้องไม่ใช่ barcode"
-    เราไม่ fix ความยาวเลขบิล แต่กัน barcode (10+ หลัก) ออก
     """
     s = as_str(s)
     return is_numeric_like(s) and (not is_barcode_like(s))
@@ -191,25 +190,26 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
             continue
         empty_run = 0
 
-        # ✅ อัปเดตเลขบิล เฉพาะค่าที่ "ไม่ใช่ barcode"
+        # ---- อ่านเวลา/วิธีจ่ายของแถวนี้ก่อน (ใช้ยืนยันหัวบิลจริง) ----
+        raw_time_now = normalize_time(row[colmap["time"]]) if colmap["time"] < len(row) else ""
+        raw_pay_now = as_str(row[colmap["pay"]]) if colmap["pay"] < len(row) else ""
+        pay_now = normalize_payment(raw_pay_now)
+
+        # ✅ อัปเดตเลขบิลเฉพาะ "หัวบิล" เท่านั้น (ต้องมีเวลา หรือ วิธีจ่าย ในแถวเดียวกัน)
         raw_bill = as_str(row[colmap["bill_no"]]) if colmap["bill_no"] < len(row) else ""
-        if raw_bill != "" and is_bill_no_text(raw_bill):
+        if raw_bill != "" and is_bill_no_text(raw_bill) and (raw_time_now != "" or pay_now != ""):
             current_bill = raw_bill
 
         if current_bill == "":
             continue
 
-        # time
-        raw_time = normalize_time(row[colmap["time"]]) if colmap["time"] < len(row) else ""
-        if raw_time != "":
-            current_time = raw_time
+        # ---- ใช้ค่าเวลา/วิธีจ่ายที่อ่านไว้ ----
+        if raw_time_now != "":
+            current_time = raw_time_now
 
-        # payment
-        raw_pay = as_str(row[colmap["pay"]]) if colmap["pay"] < len(row) else ""
-        pay = normalize_payment(raw_pay)
-        if pay != "":
-            current_payment = pay
-            payment_by_bill[current_bill] = pay
+        if pay_now != "":
+            current_payment = pay_now
+            payment_by_bill[current_bill] = pay_now
         else:
             if current_bill in payment_by_bill:
                 current_payment = payment_by_bill[current_bill]
@@ -228,7 +228,7 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
         if item == "" and item2 != "":
             item = item2
 
-        # ถ้า item เท่ากับเลขบิล ให้ลองใช้ item2 แทน
+        # ถ้า item เท่ากับเลขบิล ให้ลองใช้ item2 แทน (ไม่ให้เลขบิลไปอยู่ใน item)
         if item != "" and item == current_bill:
             if item2 != "" and item2 != current_bill:
                 item = item2
@@ -245,7 +245,7 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
         if qty is None and price is None and amount is None:
             continue
 
-        # discount: ยอดรวมสินค้าติดลบ
+        # discount: เฉพาะบรรทัดสินค้า ถ้ายอดรวมสินค้า (line_amount) ติดลบ
         discount = 0.0
         if amount is not None and amount < 0:
             discount = float(abs(amount))
@@ -295,6 +295,7 @@ def parse_rows_to_sales(rows, colmap, header_info, next_item_idx=None, stop_on_e
         .reset_index()
     )
 
+    # TOTAL row ต่อบิล
     total_rows = bill_sum.merge(last_time, on="bill_no", how="left").merge(last_pay, on="bill_no", how="left")
     total_rows["item"] = "TOTAL"
     total_rows["qty"] = None
